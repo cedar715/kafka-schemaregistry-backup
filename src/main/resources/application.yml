@@ -1,0 +1,17 @@
+spring:
+  main:
+    web-application-type: none   # a CLI tool, not a web service
+    banner-mode: off
+
+# Override on the command line, e.g. --sr.url=http://localhost:8082
+sr:
+  url: http://localhost:8081
+  username: ""                   # set both for BASIC auth
+  password: ""
+
+logging:
+  level:
+    root: WARN
+    com.example.kafka: INFO
+  pattern:
+    console: "%d{HH:mm:ss} %-5level %msg%n"
