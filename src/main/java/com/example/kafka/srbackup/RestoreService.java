@@ -7,9 +7,13 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Restores a snapshot into an EMPTY Schema Registry, preserving schema IDs.
@@ -19,9 +23,12 @@ import java.util.Map;
  *   2. mode = IMPORT          (the only mode that accepts an explicit id + version)
  *   3. register every version, ascending id (referenced schemas exist before their users)
  *   4. mode = READWRITE
- *   5. re-apply soft deletes
+ *   5. re-apply soft deletes, DEscending id (users are deleted before what they reference)
  *   6. compatibility configs (global, then per subject)
  *   7. modes (per subject, then global) - last, because READONLY would block steps 5-6
+ *
+ * Re-running with allowNonEmpty resumes a restore that stopped part-way: versions already
+ * present with the right id are skipped, and steps 4-7 are safe to repeat.
  */
 @Service
 public class RestoreService {
@@ -38,41 +45,54 @@ public class RestoreService {
         this.sr = sr;
     }
 
-    public void restore(JsonNode snapshot, boolean force) {
-        preflight(snapshot, force);
+    /**
+     * @param allowNonEmpty   restore into a registry that already has subjects (also: resume a failed restore)
+     * @param allowSameSource restore into the very registry the backup was taken from
+     */
+    public void restore(JsonNode snapshot, boolean allowNonEmpty, boolean allowSameSource) {
+        boolean targetEmpty = preflight(snapshot, allowNonEmpty, allowSameSource);
 
         List<ObjectNode> versions = flattenVersions(snapshot);
         log.info("Restoring {} versions into {}", versions.size(), sr.baseUrl());
 
         // 2. IMPORT mode (Schema Registry refuses it on a non-empty registry unless force=true)
-        sr.put(force ? "/mode?force=true" : "/mode", Map.of("mode", "IMPORT"));
+        sr.put(targetEmpty ? "/mode" : "/mode?force=true", Map.of("mode", "IMPORT"));
 
         // 3. register with the ORIGINAL id and version
-        for (ObjectNode v : versions) {
-            String subject = v.get("subject").asText();
-            int expectedId = v.get("id").asInt();
-
-            ObjectNode body = v.deepCopy();
-            body.retain(REGISTER_FIELDS);
-
-            JsonNode res = sr.post("/subjects/{s}/versions", body, subject);
-            int gotId = res.path("id").asInt(-1);
-            if (gotId != expectedId) {
-                throw new IllegalStateException("ID mismatch for " + subject + " v" + v.get("version")
-                        + ": expected " + expectedId + ", got " + gotId + ". Stop and investigate.");
+        int done = 0;
+        try {
+            for (ObjectNode v : versions) {
+                register(v, targetEmpty);
+                done++;
             }
-            log.info("  registered {} v{} id={}", subject, v.get("version"), gotId);
+        } catch (RuntimeException e) {
+            // Deliberately NOT switching back to READWRITE: while in IMPORT mode nobody can
+            // register a new schema and grab an id that is still waiting to be restored.
+            log.error("Restore stopped after {} of {} versions. The target is LEFT IN IMPORT MODE on purpose. "
+                    + "Fix the cause, then re-run with --allow-non-empty to resume.", done, versions.size());
+            throw e;
         }
 
         // 4. back to normal so we can delete / configure
         sr.put("/mode", Map.of("mode", "READWRITE"));
 
-        // 5. soft deletes
-        for (ObjectNode v : versions) {
-            if (v.path("deleted").asBoolean(false)) {
-                sr.delete("/subjects/{s}/versions/{v}", v.get("subject").asText(), v.get("version").asInt());
-                log.info("  soft-deleted {} v{}", v.get("subject").asText(), v.get("version"));
+        // 5. soft deletes, highest id first. A schema always has a higher id than the schemas it
+        //    references, and SR refuses (42206) to delete a version that a live schema still references.
+        List<ObjectNode> highestIdFirst = new ArrayList<>(versions);
+        Collections.reverse(highestIdFirst);
+        Map<String, Set<Integer>> live = new HashMap<>();
+        for (ObjectNode v : highestIdFirst) {
+            if (!v.path("deleted").asBoolean(false)) {
+                continue;
             }
+            String subject = v.get("subject").asText();
+            int version = v.get("version").asInt();
+            if (!targetEmpty && !live.computeIfAbsent(subject, this::liveVersions).contains(version)) {
+                log.info("  already soft-deleted {} v{}", subject, version);
+                continue;
+            }
+            sr.delete("/subjects/{s}/versions/{v}", subject, version);
+            log.info("  soft-deleted {} v{}", subject, version);
         }
 
         // 6. compatibility
@@ -104,21 +124,80 @@ public class RestoreService {
         log.info("Restore finished. Now run 'verify' against the same target.");
     }
 
-    private void preflight(JsonNode snapshot, boolean force) {
+    private void register(ObjectNode v, boolean targetEmpty) {
+        String subject = v.get("subject").asText();
+        int version = v.get("version").asInt();
+        int expectedId = v.get("id").asInt();
+
+        if (!targetEmpty) {
+            JsonNode existing = sr.get("/subjects/{s}/versions/{v}?deleted=true", subject, version);
+            if (existing != null) {
+                int existingId = existing.path("id").asInt(-1);
+                if (existingId != expectedId) {
+                    throw new IllegalStateException(subject + " v" + version + " already exists in the target with id "
+                            + existingId + ", but the backup has id " + expectedId + ". Stop and investigate.");
+                }
+                log.info("  already present {} v{} id={}", subject, version, existingId);
+                return;
+            }
+        }
+
+        ObjectNode body = v.deepCopy();
+        body.retain(REGISTER_FIELDS);
+
+        JsonNode res = sr.post("/subjects/{s}/versions", body, subject);
+        int gotId = res.path("id").asInt(-1);
+        // SR 8.x echoes the registered version; older versions return only the id
+        int gotVersion = res.path("version").asInt(version);
+        if (gotId != expectedId || gotVersion != version) {
+            throw new IllegalStateException("Mismatch for " + subject + ": expected v" + version + " id=" + expectedId
+                    + ", got v" + gotVersion + " id=" + gotId + ". Stop and investigate.");
+        }
+        log.info("  registered {} v{} id={}", subject, version, gotId);
+    }
+
+    /** @return true if the target registry is empty */
+    private boolean preflight(JsonNode snapshot, boolean allowNonEmpty, boolean allowSameSource) {
         if (snapshot.path("formatVersion").asInt() != BackupService.FORMAT_VERSION) {
             throw new IllegalStateException("Unsupported backup formatVersion " + snapshot.path("formatVersion"));
         }
-        String source = trim(snapshot.path("sourceUrl").asText());
-        if (source.equals(trim(sr.baseUrl())) && !force) {
+        if (!allowSameSource && isSameRegistry(snapshot)) {
             throw new IllegalStateException("Target " + sr.baseUrl()
-                    + " is the same registry this backup came from. Refusing without --force.");
+                    + " is the same registry this backup came from. Refusing without --allow-same-source.");
         }
         JsonNode existing = sr.get("/subjects?deleted=true");
-        if (existing != null && existing.size() > 0 && !force) {
-            throw new IllegalStateException("Target is not empty (" + existing.size()
-                    + " subjects). Restore needs an empty registry. Refusing without --force.");
+        boolean empty = existing == null || existing.isEmpty();
+        if (!empty && !allowNonEmpty) {
+            throw new IllegalStateException("Target is not empty (" + existing.size() + " subjects). "
+                    + "Restore needs an empty registry. Refusing without --allow-non-empty "
+                    + "(which is also how you resume a restore that stopped part-way).");
         }
-        log.info("Preflight OK: backup from {} taken {}", source, snapshot.path("createdAt").asText());
+        log.info("Preflight OK: backup from {} taken {}", snapshot.path("sourceUrl").asText(),
+                snapshot.path("createdAt").asText());
+        return empty;
+    }
+
+    /**
+     * Compares registry identities (Kafka cluster id + SR group id), so the same registry reached
+     * through a different hostname, IP or load balancer is still recognised. Falls back to comparing
+     * URLs for backups or registries that don't have the identity.
+     */
+    private boolean isSameRegistry(JsonNode snapshot) {
+        JsonNode sourceId = snapshot.get("sourceRegistryId");
+        JsonNode targetId = sr.registryId();
+        if (isSet(sourceId) && isSet(targetId)) {
+            return sourceId.equals(targetId);
+        }
+        return trim(snapshot.path("sourceUrl").asText()).equals(trim(sr.baseUrl()));
+    }
+
+    private Set<Integer> liveVersions(String subject) {
+        Set<Integer> out = new HashSet<>();
+        JsonNode versions = sr.get("/subjects/{s}/versions", subject);
+        if (versions != null) {
+            versions.forEach(n -> out.add(n.asInt()));
+        }
+        return out;
     }
 
     /** All versions of all subjects, sorted by id, then subject, then version. */

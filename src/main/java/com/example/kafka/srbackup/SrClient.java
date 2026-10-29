@@ -6,11 +6,13 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.util.DefaultUriBuilderFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 /**
  * Thin wrapper over the Schema Registry REST API.
@@ -26,7 +28,7 @@ public class SrClient {
     private final ObjectMapper mapper;
     private final String baseUrl;
 
-    public SrClient(@Value("${sr.url}") String baseUrl,
+    public SrClient(@Value("${sr.url:}") String baseUrl,
                     @Value("${sr.username:}") String username,
                     @Value("${sr.password:}") String password,
                     ObjectMapper mapper) {
@@ -38,7 +40,13 @@ public class SrClient {
         DefaultUriBuilderFactory uris = new DefaultUriBuilderFactory(baseUrl);
         uris.setEncodingMode(DefaultUriBuilderFactory.EncodingMode.VALUES_ONLY);
 
+        // without timeouts a hung registry hangs the CLI (and a scheduled backup) forever
+        HttpComponentsClientHttpRequestFactory http = new HttpComponentsClientHttpRequestFactory();
+        http.setConnectTimeout(Duration.ofSeconds(10));
+        http.setReadTimeout(Duration.ofSeconds(60));
+
         RestClient.Builder b = RestClient.builder()
+                .requestFactory(http)
                 .uriBuilderFactory(uris)
                 .defaultHeader(HttpHeaders.ACCEPT, "application/vnd.schemaregistry.v1+json, application/json");
         if (!username.isBlank()) {
@@ -49,6 +57,16 @@ public class SrClient {
 
     public String baseUrl() {
         return baseUrl;
+    }
+
+    /**
+     * The registry's identity: its Kafka cluster id plus its schema-registry group id.
+     * Unlike the URL, this is the same whichever hostname or load balancer you reach it through.
+     * Null if the endpoint does not exist.
+     */
+    public JsonNode registryId() {
+        JsonNode md = get("/v1/metadata/id");
+        return md == null ? null : md.path("scope").path("clusters");
     }
 
     /** GET. Returns null when Schema Registry answers 404 (e.g. "no subject-level config"). */

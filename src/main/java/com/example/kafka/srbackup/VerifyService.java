@@ -1,6 +1,7 @@
 package com.example.kafka.srbackup;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -53,7 +54,7 @@ public class VerifyService {
             vs.addAll(av.keySet());
             for (Integer v : vs) {
                 // whole version JSON must match: id, schema text, type, references, deleted flag ...
-                same(diffs, name + " v" + v, ev.get(v), av.get(v));
+                same(diffs, name + " v" + v, withoutTimestamp(ev.get(v)), withoutTimestamp(av.get(v)));
             }
         }
 
@@ -74,6 +75,19 @@ public class VerifyService {
         if (!Objects.equals(e, a)) {
             diffs.add(what + ": expected " + e + " but found " + a);
         }
+    }
+
+    /**
+     * SR 8.x adds "ts" (registration time) to every version. Even IMPORT mode stamps its own
+     * time, so a restore can never reproduce it - comparing it would fail every verify.
+     */
+    private static JsonNode withoutTimestamp(JsonNode version) {
+        if (!(version instanceof ObjectNode o)) {
+            return version;
+        }
+        ObjectNode copy = o.deepCopy();
+        copy.remove("ts");
+        return copy;
     }
 
     private static Map<String, JsonNode> bySubject(JsonNode snapshot) {

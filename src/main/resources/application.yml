@@ -3,10 +3,12 @@ spring:
     web-application-type: none   # a CLI tool, not a web service
     banner-mode: off
 
-# Override on the command line, e.g. --sr.url=http://localhost:8082
+# sr.url has NO default on purpose: a forgotten --sr.url on restore must not
+# silently point at whatever registry happens to be the default.
+# BASIC auth: prefer env vars SR_USERNAME / SR_PASSWORD over --sr.password,
+# which ends up in shell history and `ps` output.
 sr:
-  url: http://localhost:8081
-  username: ""                   # set both for BASIC auth
+  username: ""
   password: ""
 
 logging:

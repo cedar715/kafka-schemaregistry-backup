@@ -41,6 +41,7 @@ public class BackupService {
         snapshot.put("formatVersion", FORMAT_VERSION);
         snapshot.put("createdAt", Instant.now().toString());
         snapshot.put("sourceUrl", sr.baseUrl());
+        snapshot.set("sourceRegistryId", sr.registryId()); // null if the endpoint is missing
         snapshot.set("globalConfig", sr.get("/config"));
         snapshot.set("globalMode", sr.get("/mode"));
 
@@ -70,6 +71,10 @@ public class BackupService {
                 int version = v.asInt();
                 // raw JSON: subject, version, id, schemaType, schema, references, metadata, ruleSet ...
                 ObjectNode ver = (ObjectNode) sr.get("/subjects/{s}/versions/{v}?deleted=true", subject, version);
+                if (ver == null) {
+                    throw new IllegalStateException(subject + " v" + version
+                            + " disappeared during the backup (hard-deleted?). Re-run the backup.");
+                }
                 boolean deleted = !live.contains(version);
                 ver.put("deleted", deleted);
                 versions.add(ver);

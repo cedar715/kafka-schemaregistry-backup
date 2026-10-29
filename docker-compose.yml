@@ -5,8 +5,11 @@
 
 services:
   kafka:
-    image: apache/kafka:4.1.0
+    image: apache/kafka:4.1.1
     container_name: kafka
+    # Without this, a host reboot leaves kafka stopped while both registries
+    # (restart: on-failure) loop forever against a broker that never comes back.
+    restart: unless-stopped
     ports: ["9092:9092"]
     environment:
       KAFKA_NODE_ID: 1
@@ -21,7 +24,9 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
 
   sr-source:
-    image: confluentinc/cp-schema-registry:8.1.5
+    # NOT 8.1.5 - that published amd64 image has zero-byte binaries and every
+    # container dies with "exec /etc/confluent/docker/run: exec format error".
+    image: confluentinc/cp-schema-registry:8.1.0
     container_name: sr-source
     depends_on: [kafka]
     restart: on-failure
@@ -35,7 +40,7 @@ services:
       SCHEMA_REGISTRY_SCHEMA_REGISTRY_GROUP_ID: sr-source
 
   sr-target:
-    image: confluentinc/cp-schema-registry:8.1.5
+    image: confluentinc/cp-schema-registry:8.1.0
     container_name: sr-target
     depends_on: [kafka]
     restart: on-failure

@@ -8,13 +8,14 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  *
  * <pre>
  * java -jar sr-backup-poc.jar backup  --sr.url=http://localhost:8081 --file=backup.json
- * java -jar sr-backup-poc.jar restore --sr.url=http://localhost:8082 --file=backup.json [--force]
+ * java -jar sr-backup-poc.jar restore --sr.url=http://localhost:8082 --file=backup.json [--allow-non-empty]
  * java -jar sr-backup-poc.jar verify  --sr.url=http://localhost:8082 --file=backup.json
  * </pre>
  */
 @SpringBootApplication
 public class SrBackupApplication {
     public static void main(String[] args) {
-        SpringApplication.run(SrBackupApplication.class, args);
+        // propagate Commands' exit code (usage error, verify failure) to the shell
+        System.exit(SpringApplication.exit(SpringApplication.run(SrBackupApplication.class, args)));
     }
 }

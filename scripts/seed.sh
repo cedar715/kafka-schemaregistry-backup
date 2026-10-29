@@ -38,11 +38,29 @@ curl -sf -X DELETE "$SR/subjects/tmp-value?permanent=true" >/dev/null
 echo "== 6. Soft-delete orders-value v1 (old messages still carry its id!)"
 curl -sf -X DELETE "$SR/subjects/orders-value/versions/1"; echo
 
-echo "== 7. Compatibility: global + per subject"
+echo "== 7. Rollback: v1, v2, soft-delete v1, re-register v1's schema"
+echo "   SR drops v1 for good and creates v3 with v1's id -> version gap, and v3 has a LOWER id than v2"
+R_V1='{"type":"record","name":"R","namespace":"bank","fields":[{"name":"a","type":"int"}]}'
+R_V2='{"type":"record","name":"R","namespace":"bank","fields":[{"name":"a","type":"int"},{"name":"b","type":"int","default":0}]}'
+reg rollback-value "$(avro "$R_V1")"
+reg rollback-value "$(avro "$R_V2")"
+curl -sf -X DELETE "$SR/subjects/rollback-value/versions/1"; echo
+reg rollback-value "$(avro "$R_V1")"
+
+echo "== 8. Soft-deleted Protobuf schema AND the schema it references"
+echo "   SR only allows deleting the referenced one AFTER its user -> restore must delete in that order"
+reg common-addr "$(jq -nc --arg s 'syntax = "proto3"; package bank; message Addr { string city = 1; }' \
+  '{schemaType:"PROTOBUF", schema:$s}')"
+reg shipping-value "$(jq -nc --arg s 'syntax = "proto3"; package bank; import "addr.proto"; message Ship { Addr to = 1; }' \
+  '{schemaType:"PROTOBUF", schema:$s, references:[{name:"addr.proto", subject:"common-addr", version:1}]}')"
+curl -sf -X DELETE "$SR/subjects/shipping-value/versions/1"; echo
+curl -sf -X DELETE "$SR/subjects/common-addr/versions/1"; echo
+
+echo "== 9. Compatibility: global + per subject"
 curl -sf -X PUT -H "$CT" "$SR/config" -d '{"compatibility":"BACKWARD_TRANSITIVE"}'; echo
 curl -sf -X PUT -H "$CT" "$SR/config/orders-value" -d '{"compatibility":"FULL"}'; echo
 
-echo "== 8. Mode: one subject locked READONLY"
+echo "== 10. Mode: one subject locked READONLY"
 curl -sf -X PUT -H "$CT" "$SR/mode/customers-value" -d '{"mode":"READONLY"}'; echo
 
 echo
